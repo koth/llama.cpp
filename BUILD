@@ -10,12 +10,21 @@ cc_library(
     ],
 )
 
+
+cc_library(
+    name = "utils",
+    srcs = [
+        "utils.cpp",
+    ],
+    hdrs = [
+        "utils.h",
+    ],
+)
+
 cc_binary(
     name = "llama",
     srcs = [
         "main.cpp",
-        "utils.cpp",
-        "utils.h",
     ],
     linkopts = select({
         "//conditions:default": [],
@@ -23,5 +32,22 @@ cc_binary(
     }),
     deps = [
         ":ggml",
+        ":utils"
+    ],
+)
+
+
+cc_binary(
+    name = "quantize",
+    srcs = [
+        "quantize.cpp",
+    ],
+    linkopts = select({
+        "//conditions:default": [],
+        "@bazel_tools//src/conditions:linux_x86_64": ["-lpthread"],
+    }),
+    deps = [
+        ":ggml",
+        ":utils",
     ],
 )
