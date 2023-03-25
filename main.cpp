@@ -201,6 +201,12 @@ int main(int argc, char ** argv) {
         lparams.logits_all = params.perplexity;
         lparams.use_mlock  = params.use_mlock;
         lparams.embedding  = params.embedding;
+        if(params.tokme_path.empty()){
+            lparams.external_vocab = nullptr;
+        }else{
+            lparams.external_vocab = params.tokme_path.c_str();
+        }
+        
 
         ctx = llama_init_from_file(params.model.c_str(), lparams);
 
@@ -274,12 +280,14 @@ int main(int argc, char ** argv) {
 
     // determine newline token
     auto llama_token_newline = ::llama_tokenize(ctx, "\n", false);
-
+    char tokbuf[128]={0};
     fprintf(stderr, "\n");
     fprintf(stderr, "%s: prompt: '%s'\n", __func__, params.prompt.c_str());
     fprintf(stderr, "%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
     for (int i = 0; i < (int) embd_inp.size(); i++) {
-        fprintf(stderr, "%6d -> '%s'\n", embd_inp[i], llama_token_to_str(ctx, embd_inp[i]));
+        tokbuf[0]=0;
+        llama_token_to_str(ctx, embd_inp[i],tokbuf);
+        fprintf(stderr, "%6d -> '%s'\n", embd_inp[i], tokbuf);
     }
     fprintf(stderr, "\n");
     if (params.interactive) {
@@ -389,7 +397,7 @@ int main(int argc, char ** argv) {
                     //logits[logits.size() - n_vocab + EOS_TOKEN_ID] = 0;
                     // TODO: this does not work of params.logits_all == true
                     assert(params.perplexity == false);
-                    logits[llama_token_eos()] = 0;
+                    logits[llama_token_eos(ctx)] = 0;
                 }
 
                 id = llama_sample_top_p_top_k(ctx, last_n_tokens.data(), last_n_tokens.size(), top_k, top_p, temp, repeat_penalty);
@@ -399,7 +407,7 @@ int main(int argc, char ** argv) {
             }
 
             // replace end of text token with newline token when in interactive mode
-            if (id == llama_token_eos() && params.interactive && !params.instruct) {
+            if (id == llama_token_eos(ctx) && params.interactive && !params.instruct) {
                 id = llama_token_newline.front();
                 if (params.antiprompt.size() != 0) {
                     // tokenize and inject first reverse prompt
@@ -429,10 +437,13 @@ int main(int argc, char ** argv) {
             }
         }
 
+        char  tokbuf[128]={0};
         // display text
         if (!input_noecho) {
             for (auto id : embd) {
-                printf("%s", llama_token_to_str(ctx, id));
+                tokbuf[0]=0;
+                llama_token_to_str(ctx, id,tokbuf);
+                printf("%s",tokbuf);
             }
             fflush(stdout);
         }
@@ -447,7 +458,9 @@ int main(int argc, char ** argv) {
             // check for reverse prompt
             std::string last_output;
             for (auto id : last_n_tokens) {
-                last_output += llama_token_to_str(ctx, id);
+                tokbuf[0]=0;
+                llama_token_to_str(ctx, id,tokbuf);
+                last_output += std::string(tokbuf,tokbuf+strlen(tokbuf));
             }
 
             // Check if each of the reverse prompts appears at the end of the output.
@@ -505,7 +518,7 @@ int main(int argc, char ** argv) {
         }
 
         // end of text token
-        if (embd.back() == llama_token_eos()) {
+        if (embd.back() == llama_token_eos(ctx)) {
             if (params.instruct) {
                 is_interacting = true;
             } else {

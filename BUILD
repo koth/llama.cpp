@@ -34,7 +34,8 @@ cc_library(
     ],
     deps=[
         ":ggml",
-    ]
+        "@tokme//:tokme",
+    ],
 )
 
 cc_binary(

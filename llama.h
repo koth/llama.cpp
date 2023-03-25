@@ -55,6 +55,7 @@ extern "C" {
         bool vocab_only; // only load the vocabulary, no weights
         bool use_mlock;  // force system to keep model in RAM
         bool embedding;  // embedding mode only
+        const char* external_vocab; // if the field has set ,do not load vocab, will load use other code
     };
 
     LLAMA_API struct llama_context_params llama_context_default_params();
@@ -65,6 +66,7 @@ extern "C" {
     LLAMA_API struct llama_context * llama_init_from_file(
                              const char * path_model,
             struct llama_context_params   params);
+
 
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
@@ -115,11 +117,11 @@ extern "C" {
     LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 
     // Token Id -> String. Uses the vocabulary in the provided context
-    LLAMA_API const char * llama_token_to_str(struct llama_context * ctx, llama_token token);
+    LLAMA_API bool llama_token_to_str(struct llama_context * ctx, llama_token token, char* str_buffer);
 
     // Special tokens
-    LLAMA_API llama_token llama_token_bos();
-    LLAMA_API llama_token llama_token_eos();
+    LLAMA_API llama_token llama_token_bos(struct llama_context * ctx);
+    LLAMA_API llama_token llama_token_eos(struct llama_context * ctx);
 
     // TODO: improve the last_n_tokens interface ?
     LLAMA_API llama_token llama_sample_top_p_top_k(

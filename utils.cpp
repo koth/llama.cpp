@@ -51,6 +51,12 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.prompt = argv[i];
+        } else if (arg == "-tm" || arg == "--tokme_model") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.tokme_path = argv[i];
         } else if (arg == "-f" || arg == "--file") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -185,6 +191,7 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  -s SEED, --seed SEED  RNG seed (default: -1, use random seed for <= 0)\n");
     fprintf(stderr, "  -t N, --threads N     number of threads to use during computation (default: %d)\n", params.n_threads);
     fprintf(stderr, "  -p PROMPT, --prompt PROMPT\n");
+    fprintf(stderr, "  -tm tokme_model_path, --tokme_model tokme_model_path\n");
     fprintf(stderr, "                        prompt to start generation with (default: empty)\n");
     fprintf(stderr, "  --random-prompt       start with a randomized prompt.\n");
     fprintf(stderr, "  -f FNAME, --file FNAME\n");

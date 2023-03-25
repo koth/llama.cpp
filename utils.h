@@ -30,6 +30,7 @@ struct gpt_params {
 
     std::string model  = "models/lamma-7B/ggml-model.bin"; // model path
     std::string prompt = "";
+    std::string tokme_path ="";
 
 
     std::vector<std::string> antiprompt; // string upon seeing which more user input is prompted

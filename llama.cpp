@@ -1,6 +1,10 @@
 #include "llama.h"
 
+#include <memory>
+
 #include "ggml.h"
+
+#include "youtokentome/cpp/bpe.h"
 
 #include <cinttypes>
 #include <fstream>
@@ -26,6 +30,7 @@
 
 // determine number of model parts based on the dimension
 static const std::unordered_map<int, int> LLAMA_N_PARTS = {
+    { 2048, 1},
     { 4096, 1 },
     { 5120, 2 },
     { 6656, 4 },
@@ -35,6 +40,7 @@ static const std::unordered_map<int, int> LLAMA_N_PARTS = {
 // available llama models
 enum e_model {
     MODEL_UNKNOWN,
+    MODEL_1B,
     MODEL_7B,
     MODEL_13B,
     MODEL_30B,
@@ -48,6 +54,7 @@ static const size_t MB = 1024*1024;
 //       needs modifications in ggml
 
 static const std::map<e_model, size_t> MEM_REQ_SCRATCH0 = {
+    { MODEL_1B,    512ull*MB },
     { MODEL_7B,    512ull*MB },
     { MODEL_13B,   512ull*MB },
     { MODEL_30B,   512ull*MB },
@@ -55,6 +62,7 @@ static const std::map<e_model, size_t> MEM_REQ_SCRATCH0 = {
 };
 
 static const std::map<e_model, size_t> MEM_REQ_SCRATCH1 = {
+    { MODEL_1B,    512ull*MB },
     { MODEL_7B,    512ull*MB },
     { MODEL_13B,   512ull*MB },
     { MODEL_30B,   512ull*MB },
@@ -63,6 +71,7 @@ static const std::map<e_model, size_t> MEM_REQ_SCRATCH1 = {
 
 // 2*n_embd*n_ctx*n_layer*sizeof(float16)
 static const std::map<e_model, size_t> MEM_REQ_KV_SELF = {
+    { MODEL_1B,    512ull*MB },
     { MODEL_7B,   1026ull*MB },
     { MODEL_13B,  1608ull*MB },
     { MODEL_30B,  3124ull*MB },
@@ -72,6 +81,7 @@ static const std::map<e_model, size_t> MEM_REQ_KV_SELF = {
 // this is mostly needed for temporary mul_mat buffers to dequantize the data
 // not actually needed if BLAS is disabled
 static const std::map<e_model, size_t> MEM_REQ_EVAL = {
+    { MODEL_1B,   384ull*MB },
     { MODEL_7B,   768ull*MB },
     { MODEL_13B, 1024ull*MB },
     { MODEL_30B, 1280ull*MB },
@@ -147,6 +157,7 @@ struct llama_model {
     std::unordered_map<std::string, struct ggml_tensor *> tensors;
 };
 
+
 struct llama_vocab {
     using id    = int32_t;
     using token = std::string;
@@ -158,6 +169,7 @@ struct llama_vocab {
 
     std::unordered_map<token, id> token_to_id;
     std::vector<token_score> id_to_token;
+    std::unique_ptr<vkcom::BaseEncoder> encoder;
 };
 
 struct llama_context {
@@ -174,7 +186,7 @@ struct llama_context {
 
     llama_model model;
     llama_vocab vocab;
-
+    
     size_t mem_per_token = 0;
 
     // decode output (2-dimensional array: [n_tokens][n_vocab])
@@ -290,7 +302,8 @@ static bool llama_model_load(
         int n_ctx,
         int n_parts,
         ggml_type memory_type,
-        bool vocab_only) {
+        bool vocab_only,
+        bool external_vocab) {
     fprintf(stderr, "%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
 
     const int64_t t_start_us = ggml_time_us();
@@ -351,15 +364,15 @@ static bool llama_model_load(
         hparams.n_ctx = n_ctx;
 
         n_ff = ((2*(4*hparams.n_embd)/3 + hparams.n_mult - 1)/hparams.n_mult)*hparams.n_mult;
-
-        if (n_parts < 1) {
-            n_parts = LLAMA_N_PARTS.at(hparams.n_embd);
-        }
-
+        
         // temp warning to tell the user to use "--n_parts"
         if (hparams.f16 == 4 && n_parts != 1) {
             fprintf(stderr, "%s: GPTQ model detected - are you sure n_parts should be %d? we normally expect it to be 1\n", __func__, n_parts);
             fprintf(stderr, "%s: use '--n_parts 1' if necessary\n", __func__);
+        }
+        if (hparams.n_layer == 24) {
+            model.type = e_model::MODEL_1B;
+            n_ff = hparams.n_embd*4;
         }
 
         if (hparams.n_layer == 32) {
@@ -392,7 +405,7 @@ static bool llama_model_load(
     }
 
     // load vocab
-    {
+    if(!external_vocab){
         std::string word;
         vocab.id_to_token.resize(model.hparams.n_vocab);
         std::vector<char> tmp(64);
@@ -1192,19 +1205,25 @@ private:
 };
 
 static std::vector<llama_vocab::id> llama_tokenize(const llama_vocab & vocab, const std::string & text, bool bos) {
-    llama_tokenizer tokenizer(vocab);
-    std::vector<llama_vocab::id> output;
+    if(vocab.encoder){
+        std::vector<std::vector<int>> ids;
+        vocab.encoder->encode_as_ids({text},&ids,false);
+        return ids[0];
+    }else{
+        llama_tokenizer tokenizer(vocab);
+        std::vector<llama_vocab::id> output;
 
-    if (text.size() == 0) {
+        if (text.size() == 0) {
+            return output;
+        }
+
+        if (bos) {
+            output.push_back(1);
+        }
+
+        tokenizer.tokenize(text, output);
         return output;
     }
-
-    if (bos) {
-        output.push_back(1);
-    }
-
-    tokenizer.tokenize(text, output);
-    return output;
 }
 
 //
@@ -1235,7 +1254,7 @@ static llama_vocab::id llama_sample_top_p_top_k(
     const auto & vocab = lctx.vocab;
     const auto & logits = lctx.logits;
 
-    int n_logits = vocab.id_to_token.size();
+    int n_logits = lctx.model.hparams.n_vocab;
 
     std::vector<std::pair<double, llama_vocab::id>> logits_id;
     logits_id.reserve(n_logits);
@@ -1617,12 +1636,15 @@ struct llama_context * llama_init_from_file(
     ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     if (!llama_model_load(path_model, *ctx, params.n_ctx, params.n_parts, memory_type,
-                          params.vocab_only)) {
+                          params.vocab_only, params.external_vocab!=nullptr)) {
         fprintf(stderr, "%s: failed to load model\n", __func__);
         llama_free(ctx);
         return nullptr;
     }
-
+    if(params.external_vocab){
+        vkcom::Status status;
+        ctx->vocab.encoder.reset(new vkcom::BaseEncoder(std::string(params.external_vocab),1, &status));
+    }
     if (params.use_mlock) {
         char *err;
         if (!ggml_mlock(ctx->model.ctx, &err)) {
@@ -1724,7 +1746,7 @@ int llama_tokenize(
 }
 
 int llama_n_vocab(struct llama_context * ctx) {
-    return ctx->vocab.id_to_token.size();
+    return ctx->model.hparams.n_vocab;
 }
 
 int llama_n_ctx(struct llama_context * ctx) {
@@ -1739,19 +1761,37 @@ float * llama_get_embeddings(struct llama_context * ctx) {
     return ctx->embedding.data();
 }
 
-const char * llama_token_to_str(struct llama_context * ctx, llama_token token) {
-    if (token >= llama_n_vocab(ctx)) {
-        return nullptr;
+bool llama_token_to_str(struct llama_context * ctx, llama_token token, char* str) {
+    if (token >= llama_n_vocab(ctx) || token <0 ) {
+        return false;
     }
-
-    return ctx->vocab.id_to_token[token].tok.c_str();
+    std::string* tokstr;
+    if(ctx->vocab.encoder){
+        std::string str;
+        tokstr=&str;
+        auto status=ctx->vocab.encoder->id_to_subword(token, tokstr);
+        if(!status.ok()){
+            return false;
+        }
+    }else{
+        tokstr=&ctx->vocab.id_to_token[token].tok;
+    }
+    strncpy(str, tokstr->c_str(), tokstr->size());
+    str[tokstr->size()]=0;
+    return true;
 }
 
-llama_token llama_token_bos() {
+llama_token llama_token_bos(struct llama_context * ctx) {
+    if(ctx->vocab.encoder){
+        return ctx->vocab.encoder->bpe_state.special_tokens.bos_id;
+    }
     return 1;
 }
 
-llama_token llama_token_eos() {
+llama_token llama_token_eos(struct llama_context * ctx) {
+    if(ctx->vocab.encoder){
+        return ctx->vocab.encoder->bpe_state.special_tokens.eoc_id;
+    }
     return 2;
 }
 
