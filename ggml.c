@@ -1,12 +1,16 @@
+// Defines CLOCK_MONOTONIC and asprintf on Linux
+#define _GNU_SOURCE
+
 #include "ggml.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
-#elif !defined(__FreeBSD__) && !defined(__NetBSD__)
+#elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
 #include <alloca.h>
 #endif
 
 #include <assert.h>
+#include <errno.h>
 #include <time.h>
 #include <math.h>
 #include <stdlib.h>
@@ -28,7 +32,6 @@
 #else
 // ref: https://github.com/ggerganov/whisper.cpp/issues/168
 #include <windows.h>
-#include <errno.h>
 #endif
 
 typedef volatile LONG atomic_int;
@@ -79,6 +82,17 @@ typedef void* thread_ret_t;
 #ifdef __HAIKU__
 #define static_assert(cond, msg) _Static_assert(cond, msg)
 #endif
+
+#define GGML_MLOCK_SUPPORT 0
+
+#ifdef __has_include
+    #if __has_include(<sys/mman.h>)
+        #undef GGML_MLOCK_SUPPORT
+        #define GGML_MLOCK_SUPPORT 1
+        #include <sys/mman.h>
+    #endif
+#endif
+
 
 /*#define GGML_PERF*/
 #define GGML_DEBUG 0
@@ -160,6 +174,39 @@ typedef double ggml_float;
 
 #define GGML_COMPUTE_FP16_TO_FP32(x) _cvtsh_ss(x)
 #define GGML_COMPUTE_FP32_TO_FP16(x) _cvtss_sh(x, 0)
+
+#elif defined(__POWER9_VECTOR__)
+
+#define GGML_COMPUTE_FP16_TO_FP32(x) ggml_compute_fp16_to_fp32(x)
+#define GGML_COMPUTE_FP32_TO_FP16(x) ggml_compute_fp32_to_fp16(x)
+/* the inline asm below is about 12% faster than the lookup method */
+#define GGML_FP16_TO_FP32(x) GGML_COMPUTE_FP16_TO_FP32(x)
+#define GGML_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
+
+static inline float ggml_compute_fp16_to_fp32(ggml_fp16_t h) {
+    register float f;
+    register double d;
+    __asm__(
+        "mtfprd %0,%2\n"
+        "xscvhpdp %0,%0\n"
+        "frsp %1,%0\n" :
+        /* temp */ "=d"(d),
+        /* out */  "=f"(f):
+        /* in */   "r"(h));
+    return f;
+}
+
+static inline ggml_fp16_t ggml_compute_fp32_to_fp16(float f) {
+    register double d;
+    register ggml_fp16_t r;
+    __asm__( /* xscvdphp can work on double or single precision */
+        "xscvdphp %0,%2\n"
+        "mffprd %1,%0\n" :
+        /* temp */ "=d"(d),
+        /* out */  "=r"(r):
+        /* in */   "f"(f));
+    return r;
+}
 
 #else
 
@@ -258,6 +305,7 @@ static float table_f32_f16[1 << 16];
 
 // On ARM NEON, it's quicker to directly convert x -> x instead of calling into ggml_lookup_fp16_to_fp32,
 // so we define GGML_FP16_TO_FP32 and GGML_FP32_TO_FP16 elsewhere for NEON.
+// This is also true for POWER9.
 #if !defined(GGML_FP16_TO_FP32) || !defined(GGML_FP32_TO_FP16)
 
 inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
@@ -361,7 +409,7 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 
 // AVX routines provided by GH user Const-me
 // ref: https://github.com/ggerganov/ggml/pull/27#issuecomment-1464934600
-#if __AVX2__
+#if __AVX2__ || __AVX512F__
 // Unpack 32 4-bit fields into 32 bytes
 // The output vector contains 32 bytes, each one in [ 0 .. 15 ] interval
 static inline __m256i bytesFromNibbles( const uint8_t* rsi )
@@ -397,14 +445,15 @@ static inline __m128i packNibbles( __m256i bytes )
 }
 #endif
 
-
 // method 5
 // blocks of QK elements
 // represented with a single float (delta) and QK/2 8-bit ints (i.e QK 4-bit signed integer factors)
-void quantize_row_q4_0(const float * restrict x, void * restrict y, int k) {
-    assert(k % QK == 0);
 
+// reference implementation for deterministic creation of model files
+static void quantize_row_q4_0_reference(const float * restrict x, void * restrict y, int k) {
+    assert(k % QK == 0);
     const int nb = k / QK;
+
     const size_t bs = sizeof(float) + QK/2;
 
     uint8_t * restrict pd = ((uint8_t *)y + 0*bs);
@@ -412,7 +461,97 @@ void quantize_row_q4_0(const float * restrict x, void * restrict y, int k) {
 
     uint8_t pp[QK/2];
 
-#if __ARM_NEON
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int l = 0; l < QK; l++) {
+            const float v = x[i*QK + l];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        const float d = amax / ((1 << 3) - 1);
+        const float id = d ? 1.0f/d : 0.0f;
+
+        *(float *)pd = d;
+        pd += bs;
+
+        for (int l = 0; l < QK; l += 2) {
+            const float v0 = x[i*QK + l + 0]*id;
+            const float v1 = x[i*QK + l + 1]*id;
+
+            const uint8_t vi0 = ((int8_t) (round(v0))) + 8;
+            const uint8_t vi1 = ((int8_t) (round(v1))) + 8;
+
+            assert(vi0 >= 0 && vi0 < 16);
+            assert(vi1 >= 0 && vi1 < 16);
+
+            pp[l/2] = vi0 | (vi1 << 4);
+        }
+
+        memcpy(pb, pp, sizeof(pp));
+        pb += bs;
+    }
+}
+
+void quantize_row_q4_0(const float * restrict x, void * restrict y, int k) {
+    assert(k % QK == 0);
+
+#if __ARM_NEON || defined(__AVX2__) || defined(__wasm_simd128__) || defined(__POWER9_VECTOR__)
+    const int nb = k / QK;
+    const size_t bs = sizeof(float) + QK/2;
+
+    uint8_t * restrict pd = ((uint8_t *)y + 0*bs);
+    uint8_t * restrict pb = ((uint8_t *)y + 0*bs + sizeof(float));
+
+    uint8_t pp[QK/2];
+#endif
+
+#if defined(__POWER9_VECTOR__)
+#if QK == 32
+    const vector float v85 = vec_splats(8.5f);
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        vector float srcv [8];
+        vector float asrcv[8];
+        vector float amaxv[8];
+
+        for (int l = 0; l < 8; l++) srcv[l]  = *(vector float *)(x + i*32 + 4*l);
+        for (int l = 0; l < 8; l++) asrcv[l] = vec_abs(srcv[l]);
+
+        for (int l = 0; l < 4; l++) amaxv[2*l] = vec_max(asrcv[2*l], asrcv[2*l+1]);
+        //for (int l = 0; l < 2; l++) amaxv[4*l] = vec_max(amaxv[4*l], amaxv[4*l+2]);
+        amaxv[0] = vec_max(amaxv[0], amaxv[2]);
+        amaxv[4] = vec_max(amaxv[4], amaxv[6]);
+        //for (int l = 0; l < 1; l++) amaxv[8*l] = vec_max(amaxv[8*l], amaxv[8*l+4]);
+        amaxv[0] = vec_max(amaxv[0], amaxv[4]);
+
+        amax = MAX(
+                MAX(vec_extract(amaxv[0], 0), vec_extract(amaxv[0], 1)),
+                MAX(vec_extract(amaxv[0], 2), vec_extract(amaxv[0], 3)));
+
+        const float d = amax / ((1 << 3) - 1);
+        const float id = d ? 1.0/d : 0.0;
+
+        *(float *)pd = d;
+        pd += bs;
+
+        const vector float vid = vec_splats(id);
+        for (int l = 0; l < 8; l++) {
+            const vector float vf  = vec_madd(srcv[l], vid, v85);
+            const vector signed int vi = vec_signed(vf);
+
+            pb[2*l + 0] = vec_extract(vi, 0) | (vec_extract(vi, 1) << 4);
+            pb[2*l + 1] = vec_extract(vi, 2) | (vec_extract(vi, 3) << 4);
+        }
+
+        //memcpy(pb, pp, sizeof(pp));
+        pb += bs;
+    }
+#else
+#error "not implemented for QK"
+#endif
+#elif __ARM_NEON
 #if QK == 32
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f; // absolute max
@@ -567,36 +706,7 @@ void quantize_row_q4_0(const float * restrict x, void * restrict y, int k) {
 #endif
 #else
     // scalar
-    for (int i = 0; i < nb; i++) {
-        float amax = 0.0f; // absolute max
-
-        for (int l = 0; l < QK; l++) {
-            const float v = x[i*QK + l];
-            amax = MAX(amax, fabsf(v));
-        }
-
-        const float d = amax / ((1 << 3) - 1);
-        const float id = d ? 1.0f/d : 0.0f;
-
-        *(float *)pd = d;
-        pd += bs;
-
-        for (int l = 0; l < QK; l += 2) {
-            const float v0 = x[i*QK + l + 0]*id;
-            const float v1 = x[i*QK + l + 1]*id;
-
-            const uint8_t vi0 = ((int8_t) (round(v0))) + 8;
-            const uint8_t vi1 = ((int8_t) (round(v1))) + 8;
-
-            assert(vi0 >= 0 && vi0 < 16);
-            assert(vi1 >= 0 && vi1 < 16);
-
-            pp[l/2] = vi0 | (vi1 << 4);
-        }
-
-        memcpy(pb, pp, sizeof(pp));
-        pb += bs;
-    }
+    quantize_row_q4_0_reference(x, y, k);
 #endif
 }
 
@@ -1262,6 +1372,47 @@ inline static void ggml_vec_dot_f32(const int n, float * restrict s, const float
     *s = sumf;
 }
 
+#if __AVX512F__ && QK == 32
+static inline __m512 dot_q4_0_oneblock_avx512(
+    __m512 acc,
+    const uint8_t * pd0,
+    const uint8_t * pd1,
+    const uint8_t * pb0,
+    const uint8_t * pb1,
+    size_t bs,
+    int i
+) {
+    const float * d0_0 = (const float *) (pd0 + i*bs);
+    const float * d1_0 = (const float *) (pd1 + i*bs);
+
+    const uint8_t * restrict p0 = pb0 + (i+0)*bs;
+    const uint8_t * restrict p1 = pb1 + (i+0)*bs;
+
+    // Compute combined scale for the block
+    float scaleScalar = d0_0[0] * d1_0[0];
+    __m512 scale = _mm512_set1_ps( scaleScalar );
+
+    __m256i bx = bytesFromNibbles( p0 );
+    __m256i by = bytesFromNibbles( p1 );
+
+    // Now we have a vector with bytes in [ 0 .. 15 ] interval. Offset them into [ -8 .. +7 ] interval.
+    const __m256i off = _mm256_set1_epi8( 8 );
+    bx = _mm256_sub_epi8( bx, off );
+    by = _mm256_sub_epi8( by, off );
+
+    // Sign-extend 16 signed bytes into int16_t
+    __m512i x32 = _mm512_cvtepi8_epi16( bx );
+    __m512i y32 = _mm512_cvtepi8_epi16( by );
+    // Compute products of int16_t integers, add pairwise
+    __m512i i64 = _mm512_madd_epi16( x32, y32 );
+
+    // Convert int32_t to float
+    __m512 p = _mm512_cvtepi32_ps( i64 );
+    // Apply the scale, and accumulate
+    return _mm512_fmadd_ps( scale, p, acc );
+}
+#endif
+
 inline static void ggml_vec_dot_f16(const int n, float * restrict s, ggml_fp16_t * restrict x, ggml_fp16_t * restrict y) {
     ggml_float sumf = 0.0;
 
@@ -1414,6 +1565,40 @@ inline static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void
     }
 
     sumf = sum0 + sum1;
+#else
+#error "not implemented for QK"
+#endif
+#elif defined(__AVX512F__)
+
+#if QK == 32
+    // Initialize accumulator with zeros
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+
+    const int superblock_size = 8;
+    const int superblock_count = nb / superblock_size;
+    const int remainder = nb % superblock_size;
+
+    for (int superblock_ix = 0; superblock_ix < superblock_count; superblock_ix += 1) {
+        int i = superblock_ix * superblock_size;
+
+        acc0 = dot_q4_0_oneblock_avx512( acc0, pd0, pd1, pb0, pb1, bs, i+0 );
+        acc1 = dot_q4_0_oneblock_avx512( acc1, pd0, pd1, pb0, pb1, bs, i+1 );
+        acc0 = dot_q4_0_oneblock_avx512( acc0, pd0, pd1, pb0, pb1, bs, i+2 );
+        acc1 = dot_q4_0_oneblock_avx512( acc1, pd0, pd1, pb0, pb1, bs, i+3 );
+        acc0 = dot_q4_0_oneblock_avx512( acc0, pd0, pd1, pb0, pb1, bs, i+4 );
+        acc1 = dot_q4_0_oneblock_avx512( acc1, pd0, pd1, pb0, pb1, bs, i+5 );
+        acc0 = dot_q4_0_oneblock_avx512( acc0, pd0, pd1, pb0, pb1, bs, i+6 );
+        acc1 = dot_q4_0_oneblock_avx512( acc1, pd0, pd1, pb0, pb1, bs, i+7 );
+    }
+
+    // Remainders
+    for (int i = superblock_count * superblock_size; i < nb; ++i) {
+        acc0 = dot_q4_0_oneblock_avx512( acc0, pd0, pd1, pb0, pb1, bs, i );
+    }
+
+    // Horizontal sum of all lanes of the accumulator
+    sumf = _mm512_reduce_add_ps( acc0 ) + _mm512_reduce_add_ps( acc1 );
 #else
 #error "not implemented for QK"
 #endif
@@ -1928,7 +2113,7 @@ inline static void ggml_vec_mad_q4_1(const int n, float * restrict y, void * res
     const size_t bs = 2*sizeof(float) + QK/2;
 
     const uint8_t * restrict pd = ((const uint8_t *)x + 0*bs);
-    const uint8_t * restrict pm = ((const uint8_t *)x + 0*bs +   sizeof(float)); 
+    const uint8_t * restrict pm = ((const uint8_t *)x + 0*bs +   sizeof(float));
     const uint8_t * restrict pb = ((const uint8_t *)x + 0*bs + 2*sizeof(float));
 
     for (int i = 0; i < nb; i++) {
@@ -2249,6 +2434,7 @@ struct ggml_context {
     size_t mem_size;
     void * mem_buffer;
     bool   mem_buffer_owned;
+    bool   mem_buffer_mlocked;
 
     int n_objects;
 
@@ -2524,15 +2710,18 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
     }
 
     *ctx = (struct ggml_context) {
-        /*.mem_size         =*/ params.mem_size,
-        /*.mem_buffer       =*/ params.mem_buffer ? params.mem_buffer : malloc(params.mem_size),
-        /*.mem_buffer_owned =*/ params.mem_buffer ? false : true,
-        /*.n_objects        =*/ 0,
-        /*.objects_begin    =*/ NULL,
-        /*.objects_end      =*/ NULL,
-        /*.scratch          =*/ { 0, 0, NULL, },
-        /*.scratch_save     =*/ { 0, 0, NULL, },
+        /*.mem_size           =*/ params.mem_size,
+        /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : malloc(params.mem_size),
+        /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
+        /*.mem_buffer_mlocked =*/ false,
+        /*.n_objects          =*/ 0,
+        /*.objects_begin      =*/ NULL,
+        /*.objects_end        =*/ NULL,
+        /*.scratch            =*/ { 0, 0, NULL, },
+        /*.scratch_save       =*/ { 0, 0, NULL, },
     };
+
+    GGML_ASSERT(ctx->mem_buffer != NULL); // check for allocation failure
 
     ggml_assert_aligned(ctx->mem_buffer);
 
@@ -2555,6 +2744,14 @@ void ggml_free(struct ggml_context * ctx) {
 
             GGML_PRINT_DEBUG("%s: context %d with %d objects has been freed. memory used = %zu\n",
                     __func__, i, ctx->n_objects, ctx->objects_end->offs + ctx->objects_end->size);
+
+#if GGML_MLOCK_SUPPORT
+            if (ctx->mem_buffer_mlocked) {
+                if (munlock(ctx->mem_buffer, ctx->mem_size)) {
+                    fprintf(stderr, "%s: failed to munlock buffer: %s\n", __func__, strerror(errno));
+                }
+            }
+#endif
 
             if (ctx->mem_buffer_owned) {
                 free(ctx->mem_buffer);
@@ -2583,6 +2780,37 @@ size_t ggml_set_scratch(struct ggml_context * ctx, struct ggml_scratch scratch) 
 
     return result;
 }
+
+bool ggml_mlock_supported(void) {
+    return GGML_MLOCK_SUPPORT;
+}
+
+#if GGML_MLOCK_SUPPORT
+#ifdef __APPLE__
+    #define MLOCK_SUGGESTION "Try increasing the sysctl values 'vm.user_wire_limit' and 'vm.global_user_wire_limit' and/or\n" \
+                             "decreasing 'vm.global_no_user_wire_amount'.  Also try increasing RLIMIT_MLOCK (ulimit -l)."
+#else
+    #define MLOCK_SUGGESTION "Try increasing RLIMIT_MLOCK (ulimit -l)."
+#endif
+bool ggml_mlock(struct ggml_context * ctx, char ** err_p) {
+    if (ctx->mem_buffer_mlocked) {
+        return true;
+    }
+    if (mlock(ctx->mem_buffer, ctx->mem_size)) {
+        int ret = asprintf(err_p, "failed to mlock %zu-byte buffer: %s\n" MLOCK_SUGGESTION,
+                           ctx->mem_size, strerror(errno));
+        GGML_ASSERT(ret >= 0);
+        return false;
+    }
+    ctx->mem_buffer_mlocked = true;
+    return true;
+}
+#else // GGML_MLOCK_SUPPORT
+bool ggml_mlock(struct ggml_context * ctx, char ** err_p) {
+    *err_p = strdup("can't mlock because it's not supported on this system");
+    return false;
+}
+#endif // GGML_MLOCK_SUPPORT
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -5556,7 +5784,7 @@ static void ggml_compute_forward_rms_norm_f32(
     const size_t nb2 = dst->nb[2];
     const size_t nb3 = dst->nb[3];
 
-    const ggml_float eps = 1e-5f; // TODO: make this a parameter
+    const ggml_float eps = 1e-6f; // TODO: make this a parameter
 
     // TODO: optimize
     for (int i03 = 0; i03 < ne03; i03++) {
@@ -5572,7 +5800,7 @@ static void ggml_compute_forward_rms_norm_f32(
                 mean /= ne00;
 
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-                
+
                 memcpy(y, x, ne00 * sizeof(float));
                 // for (int i00 = 0; i00 < ne00; i00++) {
                 //     y[i00] = x[i00];
@@ -5618,17 +5846,28 @@ static bool ggml_compute_forward_mul_mat_use_blas(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
               struct ggml_tensor * dst) {
-    UNUSED(src0);
+    const int ne00 = src0->ne[0];
+    const int ne01 = src0->ne[1];
 
     const int ne10 = src1->ne[0];
 
     const int ne0 = dst->ne[0];
     const int ne1 = dst->ne[1];
 
+    // TMP: disable BLAS for now there is definitely a bug
+    return false;
+
     // TODO: find the optimal values for these
     if (ggml_is_contiguous(src0) &&
         ggml_is_contiguous(src1) && ((ne0 >= 32 && ne1 >= 32 && ne10 >= 32))) {
-        //printf("BLAS: %d %d %d\n", ne0, ne1, ne10);
+
+        // disable BLAS for Q4_0 and Q4_1
+        // there is a bug that has to be fixed before enabling
+        if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1) {
+            return false;
+        }
+
+        //printf("BLAS: %d %d %d %d %d\n", ne0, ne1, ne10, ne00, ne01);
         return true;
     }
 
@@ -10624,6 +10863,68 @@ enum ggml_opt_result ggml_opt(
     }
 
     return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+size_t ggml_quantize_q4_0(const float * src, void * dst, int n, int k, int qk, int64_t * hist) {
+    const int nb = k / qk;
+    const size_t bs = (sizeof(float) + sizeof(uint8_t)*qk/2);
+    const size_t row_size = nb*bs;
+
+    assert(k % qk == 0);
+
+    char * pdst = (char *) dst;
+
+    for (int j = 0; j < n; j += k) {
+        uint8_t * pd = (uint8_t *) (pdst + (j/k)*row_size + 0*bs);
+        uint8_t * pb = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + sizeof(float));
+
+        quantize_row_q4_0_reference(src + j, pd, k);
+
+        for (int i = 0; i < nb; i++) {
+            for (int l = 0; l < qk; l += 2) {
+                const uint8_t vi0 = pb[l/2] & 0xF;
+                const uint8_t vi1 = pb[l/2] >> 4;
+
+                hist[vi0]++;
+                hist[vi1]++;
+            }
+            pb += bs;
+        }
+    }
+
+    return (n/k)*row_size;
+}
+
+size_t ggml_quantize_q4_1(const float * src, void * dst, int n, int k, int qk, int64_t * hist) {
+    const int nb = k / qk;
+    const size_t bs = (2*sizeof(float) + sizeof(uint8_t)*qk/2);
+    const size_t row_size = nb*bs;
+
+    assert(k % qk == 0);
+
+    char * pdst = (char *) dst;
+
+    for (int j = 0; j < n; j += k) {
+        uint8_t * pd = (uint8_t *) (pdst + (j/k)*row_size + 0*bs);
+        uint8_t * pb = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + 2*sizeof(float));
+
+        quantize_row_q4_1(src + j, pd, k);
+
+        for (int i = 0; i < nb; i++) {
+            for (int l = 0; l < qk; l += 2) {
+                const uint8_t vi0 = pb[l/2] & 0xF;
+                const uint8_t vi1 = pb[l/2] >> 4;
+
+                hist[vi0]++;
+                hist[vi1]++;
+            }
+            pb += bs;
+        }
+    }
+
+    return (n/k)*row_size;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

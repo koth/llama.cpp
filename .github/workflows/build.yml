@@ -41,19 +41,28 @@ jobs:
 
     steps:
       - name: Clone
+        id: checkout
         uses: actions/checkout@v1
 
       - name: Dependencies
+        id: depends
         run: |
           sudo apt-get update
           sudo apt-get install build-essential
 
       - name: Build
+        id: cmake_build
         run: |
           mkdir build
           cd build
           cmake ..
           cmake --build . --config Release
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest --output-on-failure
 
   macOS-latest-make:
     runs-on: macos-latest
@@ -78,18 +87,27 @@ jobs:
 
     steps:
       - name: Clone
+        id: checkout
         uses: actions/checkout@v1
 
       - name: Dependencies
+        id: depends
         run: |
           brew update
 
       - name: Build
+        id: cmake_build
         run: |
           mkdir build
           cd build
-          cmake ..
+          cmake -DLLAMA_AVX2=OFF ..
           cmake --build . --config Release
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest --output-on-failure
 
   windows-latest-cmake:
     runs-on: windows-latest
@@ -107,6 +125,12 @@ jobs:
           cmake ..
           cmake --build . --config Release
 
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest -C Release --output-on-failure
+
       - name: Get commit hash
         id: commit
         if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
@@ -116,7 +140,7 @@ jobs:
         id: pack_artifacts
         if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
         run: |
-          7z a llama-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-win-x64.zip .\build\Release\*
+          7z a llama-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-win-x64.zip .\build\bin\Release\*
 
       - name: Create release
         id: create_release
