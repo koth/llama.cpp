@@ -19,10 +19,26 @@ cc_library(
     hdrs = [
         "utils.h",
     ],
+    deps=[
+        ":llama",
+    ]
+)
+
+cc_library(
+    name="llama",
+    srcs=[
+        "llama.cpp",
+    ],
+    hdrs=[
+        "llama.h"
+    ],
+    deps=[
+        ":ggml",
+    ]
 )
 
 cc_binary(
-    name = "llama",
+    name = "llama_main",
     srcs = [
         "main.cpp",
     ],
@@ -31,7 +47,7 @@ cc_binary(
         "@bazel_tools//src/conditions:linux_x86_64": ["-lpthread"],
     }),
     deps = [
-        ":ggml",
+        ":llama",
         ":utils"
     ],
 )
