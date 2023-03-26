@@ -8,6 +8,10 @@ cc_library(
     hdrs = [
         "ggml.h",
     ],
+    copts=[
+        "-msse4.2",
+    #    "-mavx",
+    ]
 )
 
 
@@ -36,6 +40,7 @@ cc_library(
         ":ggml",
         "@tokme//:tokme",
     ],
+    
 )
 
 cc_binary(

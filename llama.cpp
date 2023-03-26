@@ -91,7 +91,7 @@ static const std::map<e_model, size_t> MEM_REQ_EVAL = {
 // default hparams (LLaMA 7B)
 struct llama_hparams {
     int32_t n_vocab = 32000;
-    int32_t n_ctx   = 512;   // this is provided as user input?
+    int32_t n_ctx   = 2048;   // this is provided as user input?
     int32_t n_embd  = 4096;
     int32_t n_mult  = 256;
     int32_t n_head  = 32;

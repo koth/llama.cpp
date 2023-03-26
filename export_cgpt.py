@@ -30,7 +30,7 @@ def main():
         fout.write(struct.pack("i" * len(shape), *shape[::-1]))
         fout.write(sname)
 
-    def convert(src_name, dst_name):
+    def convert(src_name, dst_name,permute=False):
         v = model[src_name]
         shape = v.shape
         print("Processing variable: " + src_name + " with shape: ", shape, " and type: ", v.dtype)
@@ -42,6 +42,9 @@ def main():
 
         # header
         write_header(shape, dst_name, ftype_cur)
+        if permute:
+            v = v.contiguous().view(32,2,2048//32//2,2048).transpose(1,2).reshape(2048,2048)
+
 
         # data
         v.numpy().tofile(fout)
@@ -60,8 +63,8 @@ def main():
     convert("lm_head.weight", "output.weight")
 
     for i in range(24):
-        convert(f"model.layers.{i}.self_attn.q_proj.weight", f"layers.{i}.attention.wq.weight")
-        convert(f"model.layers.{i}.self_attn.k_proj.weight", f"layers.{i}.attention.wk.weight")
+        convert(f"model.layers.{i}.self_attn.q_proj.weight", f"layers.{i}.attention.wq.weight",permute=True)
+        convert(f"model.layers.{i}.self_attn.k_proj.weight", f"layers.{i}.attention.wk.weight",permute=True)
         convert(f"model.layers.{i}.self_attn.v_proj.weight", f"layers.{i}.attention.wv.weight")
         convert(f"model.layers.{i}.self_attn.o_proj.weight", f"layers.{i}.attention.wo.weight")
 

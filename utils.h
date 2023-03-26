@@ -25,7 +25,7 @@ struct gpt_params {
     // sampling parameters
     int32_t top_k = 40;
     float   top_p = 0.95f;
-    float   temp  = 0.80f;
+    float   temp  = 0.1f;
     float   repeat_penalty  = 1.10f;
 
     std::string model  = "models/lamma-7B/ggml-model.bin"; // model path
