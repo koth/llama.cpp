@@ -45,6 +45,8 @@ extern "C" {
 
     } llama_token_data;
 
+    typedef void (*llama_progress_callback)(double progress, void *ctx);
+
     struct llama_context_params {
         int n_ctx;   // text context
         int n_parts; // -1 for default
@@ -56,6 +58,11 @@ extern "C" {
         bool use_mlock;  // force system to keep model in RAM
         bool embedding;  // embedding mode only
         const char* external_vocab; // if the field has set ,do not load vocab, will load use other code
+
+        // called with a progress value between 0 and 1, pass NULL to disable
+        llama_progress_callback progress_callback;
+        // context pointer passed to the progress callback
+        void * progress_callback_user_data;
     };
 
     LLAMA_API struct llama_context_params llama_context_default_params();
@@ -104,6 +111,7 @@ extern "C" {
 
     LLAMA_API int llama_n_vocab(struct llama_context * ctx);
     LLAMA_API int llama_n_ctx  (struct llama_context * ctx);
+    LLAMA_API int llama_n_embd (struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_eval()
     // The logits for the last token are stored in the last row
@@ -125,7 +133,7 @@ extern "C" {
 
     // TODO: improve the last_n_tokens interface ?
     LLAMA_API llama_token llama_sample_top_p_top_k(
-              llama_context * ctx,
+       struct llama_context * ctx,
           const llama_token * last_n_tokens_data,
                         int   last_n_tokens_size,
                         int   top_k,
