@@ -1,4 +1,4 @@
-#include "common.h"
+#include "examples/common.h"
 #include "llama.h"
 
 std::vector<double> softmax(const std::vector<float>& logits) {
@@ -113,6 +113,11 @@ int main(int argc, char ** argv) {
         lparams.logits_all = params.perplexity;
         lparams.use_mlock  = params.use_mlock;
         lparams.embedding  = params.embedding;
+        if(params.tokme_path.empty()){
+            lparams.external_vocab = nullptr;
+        }else{
+            lparams.external_vocab = params.tokme_path.c_str();
+        }
 
         ctx = llama_init_from_file(params.model.c_str(), lparams);
 
